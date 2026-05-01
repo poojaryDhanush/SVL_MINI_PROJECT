@@ -1,0 +1,328 @@
+`timescale 1ns/1ps
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+// ============================================================
+//  INTERFACE
+// ============================================================
+interface elev_if(input bit clk);
+  logic        rst;
+  logic [1:0]  req;
+  logic        emergency;
+  logic [1:0]  current_floor;
+  logic        door_open;
+  logic        moving_up;
+  logic        moving_down;
+endinterface
+
+
+// ============================================================
+//  DUT
+// ============================================================
+module elevator(elev_if intf);
+
+  typedef enum logic [2:0] {
+    IDLE, MOVE_UP, MOVE_DOWN, DOOR_OPEN, EMERGENCY
+  } state_t;
+
+  state_t     state;
+  logic [1:0] floor;
+
+  always_ff @(posedge intf.clk) begin
+    if (intf.rst) begin
+      state            <= IDLE;
+      floor            <= 2'd0;
+      intf.door_open   <= 0;
+      intf.moving_up   <= 0;
+      intf.moving_down <= 0;
+    end
+    else begin
+      intf.door_open   <= 0;
+      intf.moving_up   <= 0;
+      intf.moving_down <= 0;
+
+      case (state)
+        IDLE: begin
+          if (intf.emergency)        state <= EMERGENCY;
+          else if (intf.req > floor) state <= MOVE_UP;
+          else if (intf.req < floor) state <= MOVE_DOWN;
+        end
+
+        MOVE_UP: begin
+          intf.moving_up <= 1;
+          floor          <= floor + 1;
+          if ((floor + 1) == intf.req) state <= DOOR_OPEN;
+        end
+
+        MOVE_DOWN: begin
+          intf.moving_down <= 1;
+          floor            <= floor - 1;
+          if ((floor - 1) == intf.req) state <= DOOR_OPEN;
+        end
+
+        DOOR_OPEN: begin
+          intf.door_open <= 1;
+          state          <= IDLE;
+        end
+
+        EMERGENCY: begin
+          intf.door_open <= 1;
+          if (!intf.emergency) state <= IDLE;
+        end
+      endcase
+    end
+  end
+
+  assign intf.current_floor = floor;
+
+endmodule
+
+
+// ============================================================
+//  TRANSACTION
+// ============================================================
+class elev_txn extends uvm_sequence_item;
+
+  rand bit [1:0] req;
+  rand bit       emergency;
+
+  `uvm_object_utils(elev_txn)
+
+  function new(string name = "elev_txn");
+    super.new(name);
+  endfunction
+
+endclass
+
+
+// ============================================================
+//  SEQUENCE  - directed: 0->3->1->2->emergency->clear->3
+// ============================================================
+class elev_seq extends uvm_sequence #(elev_txn);
+
+  `uvm_object_utils(elev_seq)
+
+  function new(string name = "elev_seq");
+    super.new(name);
+  endfunction
+
+  task send(bit [1:0] r, bit em = 0);
+    elev_txn tx = elev_txn::type_id::create("tx");
+    start_item(tx);
+    tx.req       = r;
+    tx.emergency = em;
+    finish_item(tx);
+  endtask
+
+  virtual task body();
+    send(2'd3);        // 0 -> 3
+    send(2'd1);        // 3 -> 1
+    send(2'd2);        // 1 -> 2
+    send(2'd0, 1'b1);  // emergency
+    send(2'd0, 1'b0);  // clear emergency
+    send(2'd3);        // 0 -> 3
+  endtask
+
+endclass
+
+
+// ============================================================
+//  DRIVER  - uses $display for clean output (no UVM prefix)
+// ============================================================
+class elev_driver extends uvm_driver #(elev_txn);
+
+  `uvm_component_utils(elev_driver)
+  virtual elev_if vif;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual elev_if)::get(this, "", "vif", vif))
+      `uvm_fatal("DRV", "No interface")
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    elev_txn tx;
+    @(posedge vif.clk);
+    wait(!vif.rst);
+
+    forever begin
+      seq_item_port.get_next_item(tx);
+
+      @(posedge vif.clk); #1;
+      vif.req       <= tx.req;
+      vif.emergency <= tx.emergency;
+
+      // $display prints exactly this - no path, no timestamp, no hierarchy
+      $display("[DRIVER] REQ=%0d EMERGENCY=%0b", tx.req, tx.emergency);
+
+      repeat(6) @(posedge vif.clk);
+      seq_item_port.item_done();
+    end
+  endtask
+
+endclass
+
+
+// ============================================================
+//  MONITOR  - prints only when signals change
+// ============================================================
+class elev_monitor extends uvm_component;
+
+  `uvm_component_utils(elev_monitor)
+  virtual elev_if vif;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual elev_if)::get(this, "", "vif", vif))
+      `uvm_fatal("MON", "No interface")
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    logic [1:0] prev_floor  = 2'bxx;
+    logic       prev_door   = 1'bx;
+    logic       prev_up     = 1'bx;
+    logic       prev_dn     = 1'bx;
+
+    forever begin
+      @(posedge vif.clk); #1;
+
+      // Only print when at least one signal has changed
+      if (vif.current_floor !== prev_floor ||
+          vif.door_open     !== prev_door  ||
+          vif.moving_up     !== prev_up    ||
+          vif.moving_down   !== prev_dn)
+      begin
+        $display("[MON] Floor=%0d  Door=%0b  Up=%0b  Down=%0b",
+          vif.current_floor,
+          vif.door_open,
+          vif.moving_up,
+          vif.moving_down);
+
+        prev_floor = vif.current_floor;
+        prev_door  = vif.door_open;
+        prev_up    = vif.moving_up;
+        prev_dn    = vif.moving_down;
+      end
+    end
+  endtask
+
+endclass
+
+
+// ============================================================
+//  AGENT
+// ============================================================
+class elev_agent extends uvm_agent;
+
+  `uvm_component_utils(elev_agent)
+  elev_driver               drv;
+  elev_monitor              mon;
+  uvm_sequencer #(elev_txn) seqr;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    drv  = elev_driver::type_id::create("drv",  this);
+    mon  = elev_monitor::type_id::create("mon",  this);
+    seqr = uvm_sequencer#(elev_txn)::type_id::create("seqr", this);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    drv.seq_item_port.connect(seqr.seq_item_export);
+  endfunction
+
+endclass
+
+
+// ============================================================
+//  ENV
+// ============================================================
+class elev_env extends uvm_env;
+
+  `uvm_component_utils(elev_env)
+  elev_agent agent;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    agent = elev_agent::type_id::create("agent", this);
+  endfunction
+
+endclass
+
+
+// ============================================================
+//  TEST
+// ============================================================
+class elev_test extends uvm_test;
+
+  `uvm_component_utils(elev_test)
+  elev_env env;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    env = elev_env::type_id::create("env", this);
+  endfunction
+
+  // Suppress all UVM internal messages - only $display lines will appear
+  function void start_of_simulation_phase(uvm_phase phase);
+    uvm_top.set_report_verbosity_level_hier(UVM_NONE);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    elev_seq seq;
+    phase.raise_objection(this);
+
+    seq = elev_seq::type_id::create("seq");
+    seq.start(env.agent.seqr);
+
+    #100;
+    phase.drop_objection(this);
+  endtask
+
+endclass
+
+
+// ============================================================
+//  TOP
+// ============================================================
+module tb_top;
+
+  bit clk = 0;
+  always #5 clk = ~clk;
+
+  elev_if  intf(.clk(clk));
+  elevator dut(.intf(intf));
+
+  initial begin
+    uvm_config_db#(virtual elev_if)::set(null, "*", "vif", intf);
+    run_test("elev_test");
+  end
+
+  initial begin
+    intf.rst       = 1;
+    intf.req       = 0;
+    intf.emergency = 0;
+    repeat(3) @(posedge clk);
+    intf.rst = 0;
+  end
+
+endmodule
